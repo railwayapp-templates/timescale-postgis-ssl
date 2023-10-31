@@ -19,6 +19,6 @@ The Dockerfiles contained in this repository start with the `timescale/timescale
 #### Cert expiry
 By default, the cert expiry is set to 820 days.  You can control this by configuring the `SSL_CERT_DAYS` environment variable as needed.
 
-### A note about running these images locally
+### A note about running the images locally
 
-These images do not contain support for ARM.  Check out the Dockerfiles that build these images and feel free to copy the logic to build your own image with the appropriate base image containing support for ARM.
+The images built from this repo and workflow do not contain support for ARM.  Check out the Dockerfiles that build them and feel free to copy the logic to build your own image with the appropriate base containing support for ARM.
