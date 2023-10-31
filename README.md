@@ -8,7 +8,7 @@ When you deploy the TimescaleDB + PostGIS DB service from the Railway-published 
 
 ### Why though?
 
-The (timescale/timescaledb-ha)[https://hub.docker.com/r/timescale/timescaledb-ha] image in Docker hub does not come with SSL baked in.
+The [timescale/timescaledb-ha](https://hub.docker.com/r/timescale/timescaledb-ha) image in Docker hub does not come with SSL baked in.
 
 Since this could pose a problem for applications or services attempting to connect, we decided to roll our own image with SSL enabled.
 
