@@ -16,6 +16,12 @@ Since this could pose a problem for applications or services attempting to conne
 
 The Dockerfiles contained in this repository start with the `timescale/timescaledb-ha` image as base.  Then the `init-ssl.sh` script is copied into the `docker-entrypoint-initdb.d/` directory to be executed upon initialization.
 
+#### Wrapper script
+
+You will see in the Dockerfiles that the `ENTRYPOINT` is replaced with a `wrapper.sh` script.  The only logic the wrapper executes is to `unset` the `PGHOST` environment variable prior to executing the default entrypoint.  This logic is specific to Railway and allows us to use the `PGHOST` environment variable to enable the Database View.
+
+If this logic conflicts with your use-case in any way, please feel free to spin up your own version of the image without the wrapper script.
+
 #### Cert expiry
 By default, the cert expiry is set to 820 days.  You can control this by configuring the `SSL_CERT_DAYS` environment variable as needed.
 
