@@ -13,7 +13,7 @@ jobs:
 
     strategy:
       matrix:
-        dockerfile: ['Dockerfile.pg13-ts2.12', 'Dockerfile.pg14-ts2.12','Dockerfile.pg15-ts2.12']
+        dockerfile: ['Dockerfile.pg13-ts2.12', 'Dockerfile.pg14-ts2.12','Dockerfile.pg15-ts2.12','Dockerfile.pg16-ts2.13']
 
     steps:
       - name: Checkout sources
