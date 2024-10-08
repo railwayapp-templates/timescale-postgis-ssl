@@ -1,0 +1,23 @@
+FROM timescale/timescaledb-ha:pg17-ts2.17
+
+# Switch to root user for apt operations
+USER root
+
+# Install OpenSSL and sudo
+RUN apt-get update && apt-get install -y openssl sudo
+
+# Allow the postgres user to execute certain commands as root without a password
+RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/chown, /usr/bin/openssl" > /etc/sudoers.d/postgres
+
+# Add init scripts while setting permissions
+COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
+COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
+
+# Switch back to the postgres
+USER postgres
+
+# Override the ENTRYPOINT with a wrapper script
+ENTRYPOINT ["wrapper.sh"]
+
+# Start postgres listening on port 5432
+CMD ["postgres", "--port=5432"]

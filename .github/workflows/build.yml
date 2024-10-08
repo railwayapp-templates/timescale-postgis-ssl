@@ -13,7 +13,14 @@ jobs:
 
     strategy:
       matrix:
-        dockerfile: ['Dockerfile.pg13-ts2.12', 'Dockerfile.pg14-ts2.12','Dockerfile.pg15-ts2.12','Dockerfile.pg16-ts2.13']
+        dockerfile:
+          [
+            "Dockerfile.pg13-ts2.12",
+            "Dockerfile.pg14-ts2.12",
+            "Dockerfile.pg15-ts2.12",
+            "Dockerfile.pg16-ts2.13",
+            "Dockerfile.pg17-ts2.17",
+          ]
 
     steps:
       - name: Checkout sources
@@ -21,7 +28,7 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
-        
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v2
@@ -42,7 +49,6 @@ jobs:
           version="${version#Dockerfile.}" # Remove "Dockerfile." prefix if it exists
           echo "::set-output name=version::${version}"
         shell: bash
-
 
       - name: Build and Publish
         uses: docker/build-push-action@v4
