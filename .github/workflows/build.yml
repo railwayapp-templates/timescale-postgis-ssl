@@ -2,6 +2,16 @@ name: Docker Image CI/CD for timescale + postgis image
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "Dockerfile.*"
+      - "init-ssl.sh"
+      - "wrapper.sh"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -12,32 +22,34 @@ jobs:
       id-token: write
 
     strategy:
+      fail-fast: false
       matrix:
         dockerfile:
           [
-            "Dockerfile.pg13-ts2.12",
-            "Dockerfile.pg14-ts2.12",
-            "Dockerfile.pg15-ts2.12",
-            "Dockerfile.pg16-ts2.13",
-            "Dockerfile.pg17-ts2.17",
-            "Dockerfile.pg18-ts2.23",
+            "Dockerfile.pg13-ts2.15",
+            "Dockerfile.pg14-ts2.19",
+            "Dockerfile.pg15-ts2.28",
+            "Dockerfile.pg16-ts2.29",
+            "Dockerfile.pg17-ts2.29",
+            "Dockerfile.pg18-ts2.28",
+            "Dockerfile.pg18-ts2.29",
           ]
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
         with:
           platforms: linux/amd64,linux/arm64
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -48,13 +60,220 @@ jobs:
         run: |
           version="${{ matrix.dockerfile }}"
           version="${version#Dockerfile.}" # Remove "Dockerfile." prefix if it exists
-          echo "::set-output name=version::${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Build and Publish
-        uses: docker/build-push-action@v4
+      - name: Build
+        uses: docker/build-push-action@v6
         with:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          load: true
+          push: false
           tags: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+
+      - name: Smoke test
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_pg="${VERSION%%-*}"; expected_pg="${expected_pg#pg}"
+          expected_ts="${VERSION#*-ts}"
+
+          docker network create smokenet
+
+          # PGDATA is mandatory: wrapper.sh exits 1 without it. Same path Railway mounts,
+          # so init-ssl.sh writes its certs beside the data directory as it does in prod.
+          docker run -d --name smoke --network smokenet --network-alias postgres \
+            -e POSTGRES_PASSWORD=smoke \
+            -e PGDATA=/var/lib/postgresql/data/pgdata \
+            "$IMAGE"
+
+          # docker-entrypoint.sh runs initdb.d against a temporary server bound to the
+          # unix socket only (listen_addresses=''), then shuts it down and starts the
+          # real one. Polling TCP skips that phase; polling the socket races the
+          # shutdown.
+          for _ in $(seq 1 90); do
+            docker exec smoke pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && break
+            sleep 2
+          done
+          docker exec smoke pg_isready -h 127.0.0.1 -U postgres
+
+          q() { docker exec -e PGPASSWORD=smoke smoke psql -h 127.0.0.1 -U postgres -X -tAc "$1"; }
+
+          actual_pg=$(q "select current_setting('server_version_num')::int / 10000")
+          echo "postgres major: $actual_pg (expected $expected_pg)"
+          test "$actual_pg" = "$expected_pg"
+
+          # Proves the tag is not lying about what it ships, which is the failure this
+          # workflow exists to catch: filename and base tag drifting apart.
+          q "create extension if not exists timescaledb" >/dev/null
+          actual_ts=$(q "select extversion from pg_extension where extname = 'timescaledb'")
+          echo "timescaledb: $actual_ts (expected ${expected_ts}.x)"
+          case "$actual_ts" in "${expected_ts}."*) ;; *) exit 1 ;; esac
+
+          q "create extension if not exists postgis" >/dev/null
+          echo "postgis: $(q "select extversion from pg_extension where extname = 'postgis'")"
+
+          test "$(q "show ssl")" = "on"
+          docker exec smoke test -f /var/lib/postgresql/data/certs/server.crt
+          docker exec smoke openssl x509 -noout -checkend 0 \
+            -in /var/lib/postgresql/data/certs/server.crt
+          echo "ssl on, certificate present and unexpired"
+
+      - name: PgBouncer round-trip
+        run: |
+          set -euo pipefail
+
+          # Directus reaches PostgreSQL only through this pooler, and PG18 moved the wire
+          # protocol to 3.2 — the kind of change a pooler mishandles.
+          docker run -d --name pgbouncer --network smokenet \
+            -e DB_HOST=postgres \
+            -e DB_PORT=5432 \
+            -e DB_USER=postgres \
+            -e DB_PASSWORD=smoke \
+            -e AUTH_TYPE=scram-sha-256 \
+            -e POOL_MODE=transaction \
+            -e LISTEN_PORT=6432 \
+            edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
+
+          # The client runs inside the already-started server container: this image's
+          # entrypoint is wrapper.sh, so using it standalone tries to boot a server.
+          for _ in $(seq 1 60); do
+            docker exec smoke pg_isready -h pgbouncer -p 6432 -U postgres -q 2>/dev/null && break
+            sleep 2
+          done
+
+          pooled() {
+            docker exec -e PGPASSWORD=smoke smoke \
+              psql -h pgbouncer -p 6432 -U postgres -d postgres -X -tAc "$1"
+          }
+          echo "through pgbouncer: $(pooled "select version()" | cut -c1-40)"
+          test "$(pooled "select 1 + 1")" = "2"
+          echo "pooled round-trip ok"
+
+      - name: Resolve the previous release in this line
+        id: prev
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          set -euo pipefail
+          current=$(awk -F: 'NR==1 {print $2}' "$DOCKERFILE")
+          echo "current base: $current"
+          prev=$(CURRENT="$current" python3 - <<'PY'
+          import json, os, re, urllib.request
+
+          current = os.environ["CURRENT"]
+          m = re.match(r"^pg(\d+)\.(\d+)-ts(\d+\.\d+)\.(\d+)$", current)
+          if not m:
+              print(""); raise SystemExit
+          pg_major, pg_minor, ts_line, ts_patch = m[1], int(m[2]), m[3], int(m[4])
+
+          pattern = re.compile(rf"^pg{pg_major}\.(\d+)-ts{re.escape(ts_line)}\.(\d+)$")
+          url = ("https://hub.docker.com/v2/repositories/timescale/timescaledb-ha/tags"
+                 f"?page_size=100&name=pg{pg_major}.")
+          found = []
+          for _ in range(3):
+              if not url:
+                  break
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  page = json.load(r)
+              for row in page.get("results", []):
+                  hit = pattern.match(row["name"])
+                  if hit and (int(hit[1]), int(hit[2])) < (pg_minor, ts_patch):
+                      found.append(((int(hit[1]), int(hit[2])), row["name"]))
+              url = page.get("next")
+          print(max(found)[1] if found else "")
+          PY
+          )
+          if [ -z "$prev" ]; then
+            echo "no earlier release in this line — upgrade test skipped for $current"
+          else
+            echo "previous base: $prev"
+          fi
+          echo "tag=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: Upgrade test
+        if: steps.prev.outputs.tag != ''
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          PREV: ${{ steps.prev.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # The smoke test only ever initialises an empty PGDATA; a version bump asks
+          # instead whether the new image adopts a data directory the old one created.
+          awk -v prev="$PREV" 'NR==1 {print "FROM timescale/timescaledb-ha:" prev; next} {print}' \
+            "$DOCKERFILE" > Dockerfile.previous
+          docker build -f Dockerfile.previous -t previous:test .
+
+          docker volume create pgupgrade
+          docker run --rm --user root -v pgupgrade:/var/lib/postgresql/data previous:test \
+            chown -R postgres:postgres /var/lib/postgresql/data
+
+          run_pg() {
+            docker run -d --name "$1" --network smokenet \
+              -v pgupgrade:/var/lib/postgresql/data \
+              -e POSTGRES_PASSWORD=smoke \
+              -e PGDATA=/var/lib/postgresql/data/pgdata \
+              "$2"
+            for _ in $(seq 1 90); do
+              docker exec "$1" pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && return 0
+              sleep 2
+            done
+            docker logs "$1"
+            return 1
+          }
+          on() { docker exec -e PGPASSWORD=smoke "$1" psql -h 127.0.0.1 -U postgres -X -tAc "$2"; }
+
+          run_pg old previous:test
+          glibc_of() { docker exec "$1" ldd --version | awk 'NR==1 {print $NF}'; }
+          old_glibc=$(glibc_of old)
+          echo "seeded on $(on old "select current_setting('server_version')") / glibc $old_glibc"
+          on old "create extension if not exists timescaledb" >/dev/null
+          on old "create table readings (at timestamptz not null, value double precision)" >/dev/null
+          on old "select create_hypertable('readings', 'at')" >/dev/null
+          on old "insert into readings select now() - (g || ' minutes')::interval, g from generate_series(1, 5000) g" >/dev/null
+          seeded=$(on old "select count(*) from readings")
+          echo "seeded rows: $seeded"
+          docker stop -t 60 old >/dev/null && docker rm old >/dev/null
+
+          run_pg new "$IMAGE"
+          new_glibc=$(glibc_of new)
+          echo "upgraded to $(on new "select current_setting('server_version')") / glibc $new_glibc"
+
+          # Must hold: the new binary adopts the old data directory intact.
+          test "$(on new "select count(*) from readings")" = "$seeded"
+          echo "row count preserved: $seeded"
+
+          # glibc owns libc collation order, and pg_upgrade-style adoption keeps indexes
+          # byte for byte — a changed sort order corrupts them silently, so refuse it.
+          if [ "$old_glibc" != "$new_glibc" ]; then
+            echo "glibc moved $old_glibc -> $new_glibc: text index collation may have changed."
+            echo "This bump needs a REINDEX and must not land unattended."
+            exit 1
+          fi
+          echo "glibc unchanged at $new_glibc, collation order stable"
+
+          # Reported, not enforced: a catalog/library disagreement decides automerge safety.
+          if on new "select count(*) from timescaledb_information.hypertables" >/dev/null 2>&1; then
+            echo "AUTOMERGE-SIGNAL: timescaledb usable after upgrade with no ALTER EXTENSION"
+          else
+            echo "AUTOMERGE-SIGNAL: timescaledb unusable until ALTER EXTENSION — keep ts bumps manual"
+            on new "alter extension timescaledb update" >/dev/null 2>&1 \
+              && echo "  ALTER EXTENSION timescaledb UPDATE resolved it"
+          fi
+
+      - name: Container logs
+        if: failure()
+        run: |
+          for c in smoke pgbouncer old new; do
+            docker logs "$c" 2>&1 | tail -60 | awk -v c="$c" '{print "[" c "] " $0}' || true
+          done
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        run: docker push "ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}"
