@@ -127,8 +127,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Directus reaches PostgreSQL only through this pooler, and PG18 moved the wire
-          # protocol to 3.2 — the kind of change a pooler mishandles.
+          # Directus reaches PostgreSQL only through this pooler, so a version it
+          # mishandles is an outage no test of the server alone would catch.
           docker run -d --name pgbouncer --network smokenet \
             -e DB_HOST=postgres \
             -e DB_PORT=5432 \
@@ -137,7 +137,7 @@ jobs:
             -e AUTH_TYPE=scram-sha-256 \
             -e POOL_MODE=transaction \
             -e LISTEN_PORT=6432 \
-            edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
+            edoburu/pgbouncer:v1.25.2-p0@sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340
 
           # The client runs inside the already-started server container: this image's
           # entrypoint is wrapper.sh, so using it standalone tries to boot a server.
@@ -153,6 +153,83 @@ jobs:
           echo "through pgbouncer: $(pooled "select version()" | cut -c1-40)"
           test "$(pooled "select 1 + 1")" = "2"
           echo "pooled round-trip ok"
+
+      - name: Pooled search_path handover
+        env:
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_pg="${VERSION%%-*}"; expected_pg="${expected_pg#pg}"
+
+          # track_extra_parameters has no environment variable in this image, hence a
+          # written-out config rather than a generated one.
+          poolerConfigDir="$RUNNER_TEMP/pgbouncer-tracked"
+          mkdir -p "$poolerConfigDir"
+          cat >"$poolerConfigDir/pgbouncer.ini" <<'INI'
+          [databases]
+          postgres = host=postgres port=5432 dbname=postgres
+
+          [pgbouncer]
+          listen_addr = 0.0.0.0
+          listen_port = 6432
+          auth_file = /etc/pgbouncer/userlist.txt
+          auth_type = scram-sha-256
+          pool_mode = transaction
+          default_pool_size = 1
+          max_client_conn = 100
+          ignore_startup_parameters = extra_float_digits
+          track_extra_parameters = IntervalStyle,search_path
+          admin_users = postgres
+          INI
+          # pgbouncer rejects the leading whitespace this heredoc needs to stay readable.
+          awk '{ sub(/^ +/, ""); print }' "$poolerConfigDir/pgbouncer.ini" >"$poolerConfigDir/ini.trimmed"
+          mv "$poolerConfigDir/ini.trimmed" "$poolerConfigDir/pgbouncer.ini"
+
+          # PgBouncer runs SCRAM against the server itself, so the plaintext password is
+          # what belongs here, exactly as this image's own entrypoint writes it.
+          printf '"postgres" "smoke"\n' >"$poolerConfigDir/userlist.txt"
+          chmod 0644 "$poolerConfigDir"/*
+
+          docker run -d --name pgbouncer-tracked --network smokenet \
+            -v "$poolerConfigDir/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
+            -v "$poolerConfigDir/userlist.txt:/etc/pgbouncer/userlist.txt:ro" \
+            edoburu/pgbouncer:v1.25.2-p0@sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340
+
+          for _ in $(seq 1 60); do
+            docker exec smoke pg_isready -h pgbouncer-tracked -p 6432 -U postgres -q 2>/dev/null && break
+            sleep 2
+          done
+
+          # Keeps only the last statement's result, so a leading SET command tag does not
+          # end up in the compared value.
+          tracked() {
+            docker exec -e PGPASSWORD=smoke smoke \
+              psql -h pgbouncer-tracked -p 6432 -U postgres -d postgres -X -tAc "$1" \
+              | awk 'END { print }'
+          }
+          tracked "create schema if not exists pooled_isolation" >/dev/null
+
+          # Guards the handover assertion against a server that ignored the SET entirely.
+          witness=$(tracked "set search_path to pooled_isolation; select current_schema()")
+          echo "same connection: $witness"
+          test "$witness" = "pooled_isolation"
+
+          # Separate psql invocation, so a separate client: in transaction pooling the
+          # server is released in between, carrying whatever the first client left on it.
+          tracked "set search_path to pooled_isolation" >/dev/null
+          handover=$(tracked "select current_schema()")
+          echo "next client on the same server connection: $handover"
+
+          # PG18 marks search_path GUC_REPORT (28a1121f) so the pooler can restore it;
+          # earlier majors never report it and the value leaks across clients.
+          if [ "$expected_pg" -ge 18 ]; then
+            test "$handover" = "public"
+            echo "search_path restored between clients"
+          else
+            test "$handover" = "pooled_isolation"
+            echo "search_path leaks between clients, as expected before PG18"
+          fi
 
       - name: Resolve the previous release in this line
         id: prev
@@ -270,7 +347,7 @@ jobs:
       - name: Container logs
         if: failure()
         run: |
-          for c in smoke pgbouncer old new; do
+          for c in smoke pgbouncer pgbouncer-tracked old new; do
             docker logs "$c" 2>&1 | tail -60 | awk -v c="$c" '{print "[" c "] " $0}' || true
           done
 
