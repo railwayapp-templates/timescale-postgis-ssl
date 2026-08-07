@@ -1,4 +1,4 @@
-FROM timescale/timescaledb-ha:pg17-ts2.17
+FROM timescale/timescaledb-ha:pg13.22-ts2.15.3
 
 # Switch to root user for apt operations
 USER root

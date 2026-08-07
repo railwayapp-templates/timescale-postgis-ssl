@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Base tags read pgMAJOR.MINOR-tsLINE.PATCH. Capturing the TimescaleDB line as `compatibility` stops Renovate crossing it: 2.29 dropped PostgreSQL 15, and each line already has its own Dockerfile.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb-ha"],
+      "versioning": "regex:^pg(?<major>\\d+)\\.(?<minor>\\d+)-ts(?<compatibility>\\d+\\.\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "description": "A PostgreSQL major is a new Dockerfile and an export/import migration, never a bump of an existing one.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb-ha"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "What is left is PostgreSQL and TimescaleDB patch releases. The upgrade test starts the previous release, seeds a hypertable, and asserts the new image adopts that data directory with glibc unchanged, so these can land unattended.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["timescale/timescaledb-ha"],
+      "automerge": true,
+      "platformAutomerge": false
+    }
+  ]
+}
