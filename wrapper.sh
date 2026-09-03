@@ -47,9 +47,16 @@ unset PGPORT
 
 # Call the entrypoint script with the
 # appropriate PGHOST & PGPORT and redirect
-# the output to stdout if LOG_TO_STDOUT is true
+# the output to stdout if LOG_TO_STDOUT is true.
+#
+# `exec` replaces this shell with the entrypoint (which in turn execs
+# postgres), so postgres ends up as PID 1 and receives the container's
+# stop signal directly. Without it bash stays PID 1, ignores the signal
+# (PID 1 drops unhandled signals), and every stop/restart waits out the
+# runtime's grace period and ends in SIGKILL + crash recovery instead of
+# a clean shutdown. Nothing runs after this point, so exec is safe here.
 if [[ "$LOG_TO_STDOUT" == "true" ]]; then
-    /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
+    exec /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
 else
-    /usr/local/bin/docker-entrypoint.sh "$@"
+    exec /usr/local/bin/docker-entrypoint.sh "$@"
 fi
