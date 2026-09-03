@@ -16,6 +16,12 @@ COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 # Switch back to the postgres
 USER postgres
 
+# Stop with SIGINT (postgres "fast" shutdown: disconnect clients, roll back
+# open transactions, checkpoint) instead of the default SIGTERM ("smart"
+# shutdown, which waits for every client to disconnect and so usually runs
+# out the grace period). Matches the official postgres image.
+STOPSIGNAL SIGINT
+
 # Override the ENTRYPOINT with a wrapper script
 ENTRYPOINT ["wrapper.sh"]
 
